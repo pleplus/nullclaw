@@ -21,6 +21,31 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
 }
 
 fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+    // Handle custom: prefix specially (e.g., "custom:https://example.com/v1/model")
+    if (std.mem.startsWith(u8, primary, "custom:")) {
+        // The format is "custom:<provider_url>/<model>" where <provider_url> may contain multiple slashes
+        // We need to find the slash that separates the provider from the model.
+        // The provider URL typically ends with "/v1", so we look for the pattern "/v1/" or similar.
+        // A heuristic: find the slash that is after "://<host>" and before the model name.
+        
+        // Look for the pattern "://<anything>/v1/" which indicates the end of the provider URL
+        const after_proto = std.mem.indexOf(u8, primary, "://") orelse return null;
+        const proto_end = after_proto + 3;
+        
+        // Look for "/v1/" or similar version indicator
+        const v1_marker = std.mem.indexOf(u8, primary[proto_end..], "/v1/") orelse return null;
+        const v1_pos = proto_end + v1_marker;
+        if (v1_pos + 4 >= primary.len) return null;
+        
+        // The model starts after the version marker
+        const model_start = v1_pos + 4; // skip "/v1/"
+        return .{
+            .provider = primary[0..model_start - 1], // include the trailing "/" in provider
+            .model = primary[model_start..],
+        };
+    }
+
+    // Regular provider/model format (e.g., "openrouter/anthropic/claude-sonnet-4")
     const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
     if (slash == 0 or slash + 1 >= primary.len) return null;
     return .{
@@ -296,7 +321,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
     if (root.get("default_provider")) |v| {
-        if (v == .string) self.legacy_default_provider_detected = true;
+        if (v == .string) {
+            self.default_provider = try self.allocator.dupe(u8, v.string);
+            self.legacy_default_provider_detected = true;
+        }
     }
     // Legacy key is no longer accepted. Require agents.defaults.model.primary.
     if (root.get("default_model")) |_| {
@@ -358,10 +386,16 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (mdl == .object) {
                             if (mdl.object.get("primary")) |v| {
                                 if (v == .string) {
+                                    // Always try to parse primary field - it may contain full provider/model info
+                                    // or just the model part (when legacy default_provider exists)
                                     if (splitPrimaryModelRef(v.string)) |parsed_ref| {
-                                        self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
                                         self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
-                                    } else {
+                                        // Only update provider if not already set from legacy field
+                                        if (!self.legacy_default_provider_detected) {
+                                            self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
+                                        }
+                                    } else if (!self.legacy_default_provider_detected) {
+                                        // Only fail if neither legacy nor new format provides valid data
                                         self.default_provider = "";
                                         self.default_model = null;
                                     }
