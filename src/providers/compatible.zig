@@ -927,6 +927,7 @@ fn buildChatRequestBody(
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
+    const reasoning_enabled = hasCompatReasoningEnabled(request.reasoning_effort);
 
     try buf.appendSlice(allocator, "{\"model\":\"");
     try buf.appendSlice(allocator, model);
@@ -936,13 +937,13 @@ fn buildChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
-    if (thinking_param and request.reasoning_effort != null) {
+    if (thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
     }
-    if (enable_thinking_param and request.reasoning_effort != null) {
+    if (enable_thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"enable_thinking\":true");
     }
-    if (reasoning_split_param and request.reasoning_effort != null) {
+    if (reasoning_split_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"reasoning_split\":true");
     }
     if (request.tools) |tools| {
@@ -971,6 +972,7 @@ fn buildStreamingChatRequestBody(
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
+    const reasoning_enabled = hasCompatReasoningEnabled(request.reasoning_effort);
 
     try buf.appendSlice(allocator, "{\"model\":\"");
     try buf.appendSlice(allocator, model);
@@ -980,13 +982,13 @@ fn buildStreamingChatRequestBody(
 
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
-    if (thinking_param and request.reasoning_effort != null) {
+    if (thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
     }
-    if (enable_thinking_param and request.reasoning_effort != null) {
+    if (enable_thinking_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"enable_thinking\":true");
     }
-    if (reasoning_split_param and request.reasoning_effort != null) {
+    if (reasoning_split_param and reasoning_enabled) {
         try buf.appendSlice(allocator, ",\"reasoning_split\":true");
     }
     if (request.tools) |tools| {
@@ -1000,6 +1002,11 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, ",\"stream\":true}");
 
     return try buf.toOwnedSlice(allocator);
+}
+
+fn hasCompatReasoningEnabled(reasoning_effort: ?[]const u8) bool {
+    const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return false;
+    return !std.mem.eql(u8, effort, "none");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1184,6 +1191,21 @@ test "buildChatRequestBody emits reasoning_split when configured" {
     const body = try buildChatRequestBody(allocator, req, "minimax-m2", 0.7, false, false, false, true);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") != null);
+}
+
+test "buildChatRequestBody omits provider thinking params when reasoning_effort none" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "glm-4.7-thinking",
+        .reasoning_effort = "none",
+    };
+    const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
 
 test "streamThinkSanitizeCallback strips think blocks across chunk boundaries" {
@@ -1579,6 +1601,21 @@ test "buildStreamingChatRequestBody contains stream true" {
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "buildStreamingChatRequestBody omits provider thinking params when reasoning_effort none" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "test-model",
+        .reasoning_effort = "none",
+    };
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
 
 test "supportsStreaming returns true for compatible" {

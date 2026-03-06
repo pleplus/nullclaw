@@ -527,9 +527,9 @@ fn appendOpenRouterReasoning(
 ) !void {
     const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return;
     if (std.mem.eql(u8, effort, "none")) return;
-    try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":\"");
-    try buf.appendSlice(allocator, effort);
-    try buf.appendSlice(allocator, "\"}");
+    try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
+    try root.appendJsonString(buf, allocator, effort);
+    try buf.append(allocator, '}');
 }
 
 /// HTTP GET via curl subprocess with auth header.
@@ -751,6 +751,25 @@ test "buildChatRequestBody o3 uses max_completion_tokens" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
+}
+
+test "buildChatRequestBody escapes OpenRouter reasoning effort value" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "openrouter/custom",
+        .reasoning_effort = "high\"},\"pwned\":true,\"x\":\"",
+    };
+    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "openrouter/custom", 0.7);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const reasoning = parsed.value.object.get("reasoning").?.object;
+    try std.testing.expectEqualStrings("high\"},\"pwned\":true,\"x\":\"", reasoning.get("effort").?.string);
+    try std.testing.expect(parsed.value.object.get("pwned") == null);
 }
 
 test "chatWithHistory fails without key" {
