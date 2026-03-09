@@ -119,6 +119,69 @@ fn isRemoteMediaUrl(url: []const u8) bool {
     return std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://");
 }
 
+const QQ_ATTACHMENT_CACHE_DIR = "/tmp/nullclaw_qq_media";
+const QQ_ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+fn imageExtensionFromContentType(content_type: []const u8) []const u8 {
+    if (content_type.len == 0) return ".img";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/png")) return ".png";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/jpeg")) return ".jpg";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/jpg")) return ".jpg";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/gif")) return ".gif";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/webp")) return ".webp";
+    if (std.ascii.eqlIgnoreCase(content_type, "image/bmp")) return ".bmp";
+    return ".img";
+}
+
+fn ensureAttachmentCacheDir() !void {
+    std.fs.makeDirAbsolute(QQ_ATTACHMENT_CACHE_DIR) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => try std.fs.cwd().makePath(QQ_ATTACHMENT_CACHE_DIR),
+    };
+}
+
+fn downloadImageAttachmentToLocal(
+    allocator: std.mem.Allocator,
+    image_url: []const u8,
+    content_type: []const u8,
+    auth_header_opt: ?[]const u8,
+) !?[]u8 {
+    if (!std.mem.startsWith(u8, image_url, "https://")) return null;
+
+    var header_buf: [1][]const u8 = undefined;
+    const headers: []const []const u8 = if (auth_header_opt) |auth_header| blk: {
+        header_buf[0] = auth_header;
+        break :blk header_buf[0..1];
+    } else &.{};
+
+    const image_bytes = root.http_util.curlGet(allocator, image_url, headers, "30") catch {
+        return null;
+    };
+    defer allocator.free(image_bytes);
+
+    if (image_bytes.len == 0 or image_bytes.len > QQ_ATTACHMENT_MAX_BYTES) return null;
+
+    try ensureAttachmentCacheDir();
+
+    const ext = imageExtensionFromContentType(content_type);
+    const ts: u64 = @intCast(@max(std.time.timestamp(), 0));
+    const nonce = std.crypto.random.int(u64);
+
+    var path_buf: [1024]u8 = undefined;
+    const local_path = std.fmt.bufPrint(
+        &path_buf,
+        "{s}/qq_{d}_{x}{s}",
+        .{ QQ_ATTACHMENT_CACHE_DIR, ts, nonce, ext },
+    ) catch return null;
+
+    const file = std.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch return null;
+    defer file.close();
+    file.writeAll(image_bytes) catch return null;
+
+    const owned_path = try allocator.dupe(u8, local_path);
+    return owned_path;
+}
+
 fn parseImageMarkerLine(line: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     const prefix = "[IMAGE:";
@@ -178,7 +241,7 @@ fn parseOutgoingContent(allocator: std.mem.Allocator, content: []const u8) !Pars
 
 /// Extract image attachment markers as newline-joined "[IMAGE:<url>]".
 /// Caller owns returned slice.
-fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![]u8 {
+fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value, auth_header_opt: ?[]const u8) ![]u8 {
     if (payload != .object) return allocator.dupe(u8, "");
     const attachments = payload.object.get("attachments") orelse return allocator.dupe(u8, "");
     if (attachments != .array) return allocator.dupe(u8, "");
@@ -197,10 +260,20 @@ fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![
         const is_image = (content_type.len >= 6 and std.ascii.eqlIgnoreCase(content_type[0..6], "image/")) or isImageFilename(filename);
         if (!is_image) continue;
 
+        const marker_target = blk: {
+            if (!builtin.is_test) {
+                if (try downloadImageAttachmentToLocal(allocator, url, content_type, auth_header_opt)) |local_path| {
+                    break :blk local_path;
+                }
+            }
+            break :blk try allocator.dupe(u8, url);
+        };
+        defer allocator.free(marker_target);
+
         if (!first) try out.append(allocator, '\n');
         first = false;
         try out.appendSlice(allocator, "[IMAGE:");
-        try out.appendSlice(allocator, url);
+        try out.appendSlice(allocator, marker_target);
         try out.append(allocator, ']');
     }
 
@@ -1059,7 +1132,15 @@ pub const QQChannel = struct {
 
         // Trim whitespace
         const trimmed = std.mem.trim(u8, stripped_content, " \t\n\r");
-        const image_markers = extractImageMarkers(self.allocator, d) catch |err| {
+        var auth_buf: [512]u8 = undefined;
+        const auth_header_opt: ?[]const u8 = blk: {
+            if (builtin.is_test) break :blk null;
+            const token = self.ensureAccessToken() catch break :blk null;
+            defer self.allocator.free(token);
+            break :blk buildAuthHeader(&auth_buf, token) catch null;
+        };
+
+        const image_markers = extractImageMarkers(self.allocator, d, auth_header_opt) catch |err| {
             log.info("handleMessageCreate: DROPPED — extractImageMarkers failed: {}", .{err});
             return;
         };
